@@ -22,31 +22,11 @@ import addon_utils
 from pathlib import Path
 
 # ---------------- KONFIG ----------------
-DXF_FILENAME = "rzut_2d_draft.dxf"
+DXF_PATH = Path(r"G:\My Drive\Bergamotki urządzanie\mieszkanko-bergamotki\rzut_2d_draft.dxf")
 WALL_HEIGHT = 3.0       # m
 OUTER_THICK = 0.35      # m
 SCALE = 0.001           # mm -> m
 # ----------------------------------------
-
-
-def script_dir():
-    """Katalog ze skryptem — dziala i z Text Editora i z CLI."""
-    try:
-        text = bpy.context.space_data.text
-        if text and text.filepath:
-            return Path(bpy.path.abspath(text.filepath)).parent
-    except AttributeError:
-        pass
-    try:
-        return Path(__file__).resolve().parent
-    except NameError:
-        pass
-    raise RuntimeError(
-        "Nie moge ustalic katalogu skryptu — wpisz DXF_PATH recznie."
-    )
-
-
-DXF_PATH = script_dir() / DXF_FILENAME
 
 
 def reset_scene():
