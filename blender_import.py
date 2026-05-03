@@ -113,46 +113,149 @@ def bbox_area(edges):
     return (max(xs) - min(xs)) * (max(ys) - min(ys))
 
 
-def split_outer(bm):
-    """Zwraca (outer_bm, inner_bm) — outer = najwiekszy bbox component."""
+def split_outer_edges(bm):
+    """Zwraca (outer_edges, inner_edges) - listy BMEdge z bm."""
     comps = get_connected_components(bm)
     comps.sort(key=bbox_area, reverse=True)
     outer_set = {e.index for e in comps[0]}
     print(f"  znaleziono {len(comps)} spojnych komponentow; "
           f"outer ma {len(comps[0])} krawedzi")
-
-    bm.verts.index_update()
-
-    def copy_to(target, edges):
-        vmap = {}
-        for e in edges:
-            v0, v1 = e.verts
-            for v in (v0, v1):
-                if v.index not in vmap:
-                    vmap[v.index] = target.verts.new(v.co)
-            try:
-                target.edges.new((vmap[v0.index], vmap[v1.index]))
-            except ValueError:
-                pass  # duplikat krawedzi
-        target.verts.index_update()
-        target.edges.index_update()
-
-    outer_bm = bmesh.new()
-    inner_bm = bmesh.new()
-    outer_edges = [e for e in bm.edges if e.index in outer_set]
-    inner_edges = [e for e in bm.edges if e.index not in outer_set]
-    copy_to(outer_bm, outer_edges)
-    copy_to(inner_bm, inner_edges)
-    return outer_bm, inner_bm
+    outer = [e for e in bm.edges if e.index in outer_set]
+    inner = [e for e in bm.edges if e.index not in outer_set]
+    return outer, inner
 
 
-def extrude_bmesh_up(bm, height):
-    edges = list(bm.edges)
+def extract_loop_2d(edges):
+    """Z listy krawedzi tworzacych zamkniety pierscien wyciaga kolejne (x,y)
+    w kolejnosci wokol obwodu. Zwraca [] jesli nie da sie domknac."""
     if not edges:
-        return
-    ret = bmesh.ops.extrude_edge_only(bm, edges=edges)
-    new_verts = [g for g in ret["geom"] if isinstance(g, bmesh.types.BMVert)]
-    bmesh.ops.translate(bm, vec=(0, 0, height), verts=new_verts)
+        return []
+    # zbuduj graf
+    adj = {}
+    for e in edges:
+        v0, v1 = e.verts
+        adj.setdefault(v0, []).append(v1)
+        adj.setdefault(v1, []).append(v0)
+
+    # sprawdz ze wszystkie wierzcholki maja dokladnie 2 sasiadow (czysta petla)
+    bad = [v for v, ns in adj.items() if len(ns) != 2]
+    if bad:
+        print(f"  UWAGA: outer ma {len(bad)} wierzcholkow nie-2-stopniowych")
+        return []
+
+    start = next(iter(adj))
+    loop = [start]
+    prev = None
+    cur = start
+    while True:
+        nbrs = adj[cur]
+        nxt = nbrs[0] if nbrs[0] != prev else nbrs[1]
+        if nxt == start:
+            break
+        loop.append(nxt)
+        prev = cur
+        cur = nxt
+        if len(loop) > len(adj) + 1:
+            return []  # cos sie zaplatalo
+    return [(v.co.x, v.co.y) for v in loop]
+
+
+def signed_area_2d(pts):
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += (x2 - x1) * (y2 + y1)
+    return s
+
+
+def offset_polygon_inward(pts, offset):
+    """2D offset zamknietej polilinii o `offset` do wewnatrz.
+    Dziala dla dowolnych pętli (nie tylko prostokątnych)."""
+    n = len(pts)
+    ccw = signed_area_2d(pts) < 0  # CCW = ujemne pole w naszej konwencji
+    # zbuduj offsetowane segmenty
+    offsets = []
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        L = (dx * dx + dy * dy) ** 0.5
+        if L == 0:
+            offsets.append(((x1, y1), (x2, y2)))
+            continue
+        if ccw:
+            nx, ny = -dy / L, dx / L
+        else:
+            nx, ny = dy / L, -dx / L
+        offsets.append(((x1 + nx * offset, y1 + ny * offset),
+                        (x2 + nx * offset, y2 + ny * offset)))
+
+    # przeciecia kolejnych offsetowanych segmentow
+    out = []
+    for i in range(n):
+        p1, p2 = offsets[(i - 1) % n]
+        p3, p4 = offsets[i]
+        x1, y1 = p1; x2, y2 = p2
+        x3, y3 = p3; x4, y4 = p4
+        denom = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3)
+        if abs(denom) < 1e-9:
+            out.append(p2)
+        else:
+            t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / denom
+            out.append((x1 + t * (x2 - x1), y1 + t * (y2 - y1)))
+    return out
+
+
+def build_outer_wall_bmesh(outer_2d, thickness, height):
+    """Buduje pelny prostopadloscienny pierscien sciany (outer + inner kontur,
+    podloga, sufit, oba lica) — wynikowo wodoszczelny solid."""
+    inner_2d = offset_polygon_inward(outer_2d, thickness)
+
+    bm = bmesh.new()
+    n = len(outer_2d)
+    bo = [bm.verts.new((x, y, 0)) for x, y in outer_2d]
+    bi = [bm.verts.new((x, y, 0)) for x, y in inner_2d]
+    to = [bm.verts.new((x, y, height)) for x, y in outer_2d]
+    ti = [bm.verts.new((x, y, height)) for x, y in inner_2d]
+
+    for i in range(n):
+        j = (i + 1) % n
+        # zewnetrzne lico
+        bm.faces.new([bo[i], bo[j], to[j], to[i]])
+        # wewnetrzne lico (odwrotna kolejnosc — normalna do srodka)
+        bm.faces.new([bi[j], bi[i], ti[i], ti[j]])
+        # gora (cap)
+        bm.faces.new([to[i], to[j], ti[j], ti[i]])
+        # dol
+        bm.faces.new([bi[i], bi[j], bo[j], bo[i]])
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    return bm
+
+
+def build_inner_walls_bmesh(inner_edges, height):
+    """Wszystkie pozostale linie - extrude w gore jako pionowe plaszczyzny."""
+    bm = bmesh.new()
+    vmap = {}
+    for e in inner_edges:
+        v0, v1 = e.verts
+        for v in (v0, v1):
+            if v.index not in vmap:
+                vmap[v.index] = bm.verts.new(v.co)
+        try:
+            bm.edges.new((vmap[v0.index], vmap[v1.index]))
+        except ValueError:
+            pass
+    bm.verts.index_update()
+    bm.edges.index_update()
+    edges = list(bm.edges)
+    if edges:
+        ret = bmesh.ops.extrude_edge_only(bm, edges=edges)
+        new_verts = [g for g in ret["geom"] if isinstance(g, bmesh.types.BMVert)]
+        bmesh.ops.translate(bm, vec=(0, 0, height), verts=new_verts)
+    return bm
 
 
 def make_object_from_bmesh(bm, name):
@@ -164,10 +267,11 @@ def make_object_from_bmesh(bm, name):
     return obj
 
 
-def add_solidify(obj, thickness, offset=-1.0):
+def add_solidify(obj, thickness, offset=0.0):
     mod = obj.modifiers.new(name="Solidify", type="SOLIDIFY")
     mod.thickness = thickness
     mod.offset = offset
+    mod.use_even_offset = True
 
 
 def cleanup_orphan_curves():
@@ -204,18 +308,27 @@ def main():
     bm.edges.index_update()
     print(f"  po merge: {len(bm.verts)} v, {len(bm.edges)} e")
 
-    outer_bm, inner_bm = split_outer(bm)
-    bm.free()
+    outer_edges, inner_edges = split_outer_edges(bm)
 
-    extrude_bmesh_up(outer_bm, WALL_HEIGHT)
-    extrude_bmesh_up(inner_bm, WALL_HEIGHT)
-
+    outer_2d = extract_loop_2d(outer_edges)
     cleanup_orphan_curves()
 
-    outer_obj = make_object_from_bmesh(outer_bm, "ScianyZewnetrzne")
-    inner_obj = make_object_from_bmesh(inner_bm, "ScianyWewnetrzne")
-    add_solidify(outer_obj, OUTER_THICK, offset=-1.0)
+    if outer_2d:
+        print(f"  outer loop: {len(outer_2d)} wierzcholkow — buduje solid")
+        outer_bm = build_outer_wall_bmesh(outer_2d, OUTER_THICK, WALL_HEIGHT)
+        outer_obj = make_object_from_bmesh(outer_bm, "ScianyZewnetrzne")
+    else:
+        print("  outer nie domknal sie — fallback na ribbon + Solidify")
+        outer_bm = build_inner_walls_bmesh(outer_edges, WALL_HEIGHT)
+        outer_obj = make_object_from_bmesh(outer_bm, "ScianyZewnetrzne")
+        add_solidify(outer_obj, OUTER_THICK, offset=-1.0)
 
+    inner_bm = build_inner_walls_bmesh(inner_edges, WALL_HEIGHT)
+    inner_obj = make_object_from_bmesh(inner_bm, "ScianyWewnetrzne")
+    # delikatna grubosc na wewn. plaszczyznach zeby byly widoczne jako 3D
+    add_solidify(inner_obj, 0.05, offset=0.0)
+
+    bm.free()
     print(f"OK — wysokosc {WALL_HEIGHT} m, sciany zewn. {OUTER_THICK*100:.0f} cm")
 
 
