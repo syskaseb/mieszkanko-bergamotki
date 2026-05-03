@@ -52,19 +52,43 @@ def import_svg(path):
     bpy.ops.import_curve.svg(filepath=str(path))
 
 
+def relink_to_scene_root(objs):
+    """Przerzuca obiekty do glownej collection sceny (zeby byly widoczne
+    dla view_layer i operatorow bpy.ops)."""
+    root = bpy.context.scene.collection
+    for o in objs:
+        for coll in list(o.users_collection):
+            try:
+                coll.objects.unlink(o)
+            except RuntimeError:
+                pass
+        if o.name not in root.objects:
+            root.objects.link(o)
+
+
 def join_to_single_mesh(name="Plan2D"):
-    bpy.ops.object.select_all(action="DESELECT")
-    curves = [o for o in bpy.context.scene.objects if o.type == "CURVE"]
+    curves = [o for o in bpy.data.objects if o.type == "CURVE"]
+    print(f"  znaleziono {len(curves)} krzywych w SVG")
     if not curves:
         raise RuntimeError("SVG nie zaimportowal zadnych krzywych")
 
+    relink_to_scene_root(curves)
+
+    bpy.ops.object.select_all(action="DESELECT")
     for o in curves:
         o.select_set(True)
     bpy.context.view_layer.objects.active = curves[0]
     bpy.ops.object.convert(target="MESH")
 
-    bpy.ops.object.select_all(action="SELECT")
-    meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+    meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+    print(f"  po konwersji: {len(meshes)} meshy")
+    if not meshes:
+        raise RuntimeError("Konwersja curve->mesh nie utworzyla zadnych meshy")
+
+    relink_to_scene_root(meshes)
+    bpy.ops.object.select_all(action="DESELECT")
+    for o in meshes:
+        o.select_set(True)
     bpy.context.view_layer.objects.active = meshes[0]
     bpy.ops.object.join()
 
