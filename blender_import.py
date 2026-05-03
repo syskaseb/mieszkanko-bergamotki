@@ -67,33 +67,43 @@ def relink_to_scene_root(objs):
 
 
 def join_to_single_mesh(name="Plan2D"):
+    """Konwertuje wszystkie krzywe do jednego mesha bez uzywania bpy.ops
+    (w Blender 5.x convert operator bywa zawodny w kontekscie skryptu)."""
     curves = [o for o in bpy.data.objects if o.type == "CURVE"]
     print(f"  znaleziono {len(curves)} krzywych w SVG")
     if not curves:
         raise RuntimeError("SVG nie zaimportowal zadnych krzywych")
 
-    relink_to_scene_root(curves)
+    combined = bmesh.new()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for c in curves:
+        eval_obj = c.evaluated_get(depsgraph)
+        tmp_mesh = eval_obj.to_mesh()
+        if tmp_mesh is None:
+            continue
+        # transform do world space
+        tmp_mesh.transform(c.matrix_world)
+        combined.from_mesh(tmp_mesh)
+        eval_obj.to_mesh_clear()
 
-    bpy.ops.object.select_all(action="DESELECT")
-    for o in curves:
-        o.select_set(True)
-    bpy.context.view_layer.objects.active = curves[0]
-    bpy.ops.object.convert(target="MESH")
+    print(f"  zbudowany bmesh: {len(combined.verts)} v, {len(combined.edges)} e")
+    if len(combined.verts) == 0:
+        combined.free()
+        raise RuntimeError("Krzywe SVG sa puste — brak geometrii do ekstruzji")
 
-    meshes = [o for o in bpy.data.objects if o.type == "MESH"]
-    print(f"  po konwersji: {len(meshes)} meshy")
-    if not meshes:
-        raise RuntimeError("Konwersja curve->mesh nie utworzyla zadnych meshy")
+    mesh_data = bpy.data.meshes.new(name)
+    combined.to_mesh(mesh_data)
+    combined.free()
 
-    relink_to_scene_root(meshes)
-    bpy.ops.object.select_all(action="DESELECT")
-    for o in meshes:
-        o.select_set(True)
-    bpy.context.view_layer.objects.active = meshes[0]
-    bpy.ops.object.join()
+    obj = bpy.data.objects.new(name, mesh_data)
+    bpy.context.scene.collection.objects.link(obj)
 
-    obj = bpy.context.active_object
-    obj.name = name
+    # usun stare krzywe
+    for c in curves:
+        bpy.data.objects.remove(c, do_unlink=True)
+
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
     return obj
 
 
