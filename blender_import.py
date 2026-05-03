@@ -14,6 +14,9 @@ Co robi:
       mu grubosc 35 cm + wysokosc 3 m
     - reszte linii (sciany wewnetrzne narysowane parami + linie konstrukcyjne)
       wyciaga pionowo do 3 m jako plaszczyzny
+
+Implementacja: cala geometria budowana w bmesh, nie ma zaleznosci od
+kontekstu bpy.ops (w Blender 5.x to bywa kruche w skryptach).
 """
 
 import re
@@ -34,15 +37,13 @@ def reset_scene():
 
 
 def parse_svg_dimensions_mm(path):
-    """Wyciaga width/height z SVG, zwraca (w_mm, h_mm)."""
     text = path.read_text(encoding="utf-8")
     def grab(attr):
         m = re.search(rf'{attr}="([0-9.]+)\s*mm"', text)
         if not m:
             m = re.search(rf'{attr}="([0-9.]+)"', text)
         return float(m.group(1)) if m else None
-    w = grab("width")
-    h = grab("height")
+    w, h = grab("width"), grab("height")
     if w is None or h is None:
         raise RuntimeError("Nie udalo sie odczytac width/height z SVG")
     return w, h
@@ -52,152 +53,115 @@ def import_svg(path):
     bpy.ops.import_curve.svg(filepath=str(path))
 
 
-def relink_to_scene_root(objs):
-    """Przerzuca obiekty do glownej collection sceny (zeby byly widoczne
-    dla view_layer i operatorow bpy.ops)."""
-    root = bpy.context.scene.collection
-    for o in objs:
-        for coll in list(o.users_collection):
-            try:
-                coll.objects.unlink(o)
-            except RuntimeError:
-                pass
-        if o.name not in root.objects:
-            root.objects.link(o)
-
-
-def join_to_single_mesh(name="Plan2D"):
-    """Konwertuje wszystkie krzywe do jednego mesha bez uzywania bpy.ops
-    (w Blender 5.x convert operator bywa zawodny w kontekscie skryptu)."""
-    curves = [o for o in bpy.data.objects if o.type == "CURVE"]
-    print(f"  znaleziono {len(curves)} krzywych w SVG")
-    if not curves:
-        raise RuntimeError("SVG nie zaimportowal zadnych krzywych")
-
-    combined = bmesh.new()
+def build_combined_bmesh(curves):
+    bm = bmesh.new()
     depsgraph = bpy.context.evaluated_depsgraph_get()
     for c in curves:
         eval_obj = c.evaluated_get(depsgraph)
-        tmp_mesh = eval_obj.to_mesh()
-        if tmp_mesh is None:
+        tmp = eval_obj.to_mesh()
+        if tmp is None:
             continue
-        # transform do world space
-        tmp_mesh.transform(c.matrix_world)
-        combined.from_mesh(tmp_mesh)
+        tmp.transform(c.matrix_world)
+        bm.from_mesh(tmp)
         eval_obj.to_mesh_clear()
-
-    print(f"  zbudowany bmesh: {len(combined.verts)} v, {len(combined.edges)} e")
-    if len(combined.verts) == 0:
-        combined.free()
-        raise RuntimeError("Krzywe SVG sa puste — brak geometrii do ekstruzji")
-
-    mesh_data = bpy.data.meshes.new(name)
-    combined.to_mesh(mesh_data)
-    combined.free()
-
-    obj = bpy.data.objects.new(name, mesh_data)
-    bpy.context.scene.collection.objects.link(obj)
-
-    # usun stare krzywe
-    for c in curves:
-        bpy.data.objects.remove(c, do_unlink=True)
-
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    return obj
+    return bm
 
 
-def rescale_to_meters(obj, target_w_m, target_h_m):
-    """Mierzy obecny bbox (w lokalnych jednostkach Blendera po imporcie SVG)
-    i skaluje tak, zeby zgadzal sie z target w metrach."""
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    coords = [v.co for v in obj.data.vertices]
-    xs = [c.x for c in coords]
-    ys = [c.y for c in coords]
+def scale_and_center_bmesh(bm, target_w_m, target_h_m):
+    xs = [v.co.x for v in bm.verts]
+    ys = [v.co.y for v in bm.verts]
     cur_w = max(xs) - min(xs)
     cur_h = max(ys) - min(ys)
-    sx = target_w_m / cur_w if cur_w else 1.0
-    sy = target_h_m / cur_h if cur_h else 1.0
-    s = (sx + sy) / 2.0  # jednolita skala (zachowac proporcje)
-    obj.scale = (s, s, s)
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    s = ((target_w_m / cur_w) + (target_h_m / cur_h)) / 2 if cur_w and cur_h else 1.0
+    print(f"  skala: x{s:.6f}  (current bbox: {cur_w:.3f} x {cur_h:.3f})")
+    cx = (max(xs) + min(xs)) / 2
+    cy = (max(ys) + min(ys)) / 2
+    for v in bm.verts:
+        v.co.x = (v.co.x - cx) * s
+        v.co.y = (v.co.y - cy) * s
+        v.co.z = v.co.z * s
 
 
-def merge_doubles(obj, dist):
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.mesh.remove_doubles(threshold=dist)
-    bpy.ops.object.mode_set(mode="OBJECT")
-
-
-def center_origin(obj):
-    bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
-    obj.location = (0, 0, 0)
-
-
-def find_largest_component_edges(obj):
-    """Indeksy krawedzi najwiekszego (po bbox 2D) spojnego komponentu."""
-    bm = bmesh.new()
-    bm.from_mesh(obj.data)
-
+def get_connected_components(bm):
+    bm.edges.index_update()
     visited = set()
-    components = []
+    comps = []
     for start in bm.edges:
         if start.index in visited:
             continue
         stack = [start]
         comp = []
         while stack:
-            e = stack.pop()
-            if e.index in visited:
+            cur = stack.pop()
+            if cur.index in visited:
                 continue
-            visited.add(e.index)
-            comp.append(e)
-            for v in e.verts:
+            visited.add(cur.index)
+            comp.append(cur)
+            for v in cur.verts:
                 for ne in v.link_edges:
                     if ne.index not in visited:
                         stack.append(ne)
-        components.append(comp)
+        comps.append(comp)
+    return comps
 
-    def bbox_area(edges):
-        xs, ys = [], []
+
+def bbox_area(edges):
+    xs, ys = [], []
+    for e in edges:
+        for v in e.verts:
+            xs.append(v.co.x); ys.append(v.co.y)
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def split_outer(bm):
+    """Zwraca (outer_bm, inner_bm) — outer = najwiekszy bbox component."""
+    comps = get_connected_components(bm)
+    comps.sort(key=bbox_area, reverse=True)
+    outer_set = {e.index for e in comps[0]}
+    print(f"  znaleziono {len(comps)} spojnych komponentow; "
+          f"outer ma {len(comps[0])} krawedzi")
+
+    bm.verts.index_update()
+
+    def copy_to(target, edges):
+        vmap = {}
         for e in edges:
-            for v in e.verts:
-                xs.append(v.co.x); ys.append(v.co.y)
-        return (max(xs) - min(xs)) * (max(ys) - min(ys))
+            v0, v1 = e.verts
+            for v in (v0, v1):
+                if v.index not in vmap:
+                    vmap[v.index] = target.verts.new(v.co)
+            try:
+                target.edges.new((vmap[v0.index], vmap[v1.index]))
+            except ValueError:
+                pass  # duplikat krawedzi
+        target.verts.index_update()
+        target.edges.index_update()
 
-    components.sort(key=bbox_area, reverse=True)
-    outer_idx = {e.index for e in components[0]}
+    outer_bm = bmesh.new()
+    inner_bm = bmesh.new()
+    outer_edges = [e for e in bm.edges if e.index in outer_set]
+    inner_edges = [e for e in bm.edges if e.index not in outer_set]
+    copy_to(outer_bm, outer_edges)
+    copy_to(inner_bm, inner_edges)
+    return outer_bm, inner_bm
+
+
+def extrude_bmesh_up(bm, height):
+    edges = list(bm.edges)
+    if not edges:
+        return
+    ret = bmesh.ops.extrude_edge_only(bm, edges=edges)
+    new_verts = [g for g in ret["geom"] if isinstance(g, bmesh.types.BMVert)]
+    bmesh.ops.translate(bm, vec=(0, 0, height), verts=new_verts)
+
+
+def make_object_from_bmesh(bm, name):
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
     bm.free()
-    return outer_idx
-
-
-def separate_edges(obj, edge_indices, new_name):
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="OBJECT")
-    for v in obj.data.vertices:
-        v.select = False
-    for e in obj.data.edges:
-        e.select = e.index in edge_indices
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.separate(type="SELECTED")
-    bpy.ops.object.mode_set(mode="OBJECT")
-    new_obj = [o for o in bpy.context.selected_objects if o is not obj][-1]
-    new_obj.name = new_name
-    return new_obj
-
-
-def extrude_up(obj, height):
-    bpy.ops.object.select_all(action="DESELECT")
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.mesh.extrude_edges_move(
-        TRANSFORM_OT_translate={"value": (0, 0, height)}
-    )
-    bpy.ops.object.mode_set(mode="OBJECT")
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
 
 
 def add_solidify(obj, thickness, offset=-1.0):
@@ -206,28 +170,51 @@ def add_solidify(obj, thickness, offset=-1.0):
     mod.offset = offset
 
 
+def cleanup_orphan_curves():
+    for o in list(bpy.data.objects):
+        if o.type == "CURVE":
+            bpy.data.objects.remove(o, do_unlink=True)
+
+
 def main():
     reset_scene()
 
-    target_w_mm, target_h_mm = parse_svg_dimensions_mm(SVG_PATH)
-    target_w_m = target_w_mm / 1000.0
-    target_h_m = target_h_mm / 1000.0
-    print(f"SVG viewBox: {target_w_mm:.1f} x {target_h_mm:.1f} mm "
-          f"-> {target_w_m:.3f} x {target_h_m:.3f} m")
+    w_mm, h_mm = parse_svg_dimensions_mm(SVG_PATH)
+    target_w = w_mm / 1000.0
+    target_h = h_mm / 1000.0
+    print(f"SVG viewBox: {w_mm:.1f} x {h_mm:.1f} mm "
+          f"-> {target_w:.3f} x {target_h:.3f} m")
 
     import_svg(SVG_PATH)
-    plan = join_to_single_mesh("Plan2D")
-    rescale_to_meters(plan, target_w_m, target_h_m)
-    merge_doubles(plan, MERGE_DIST)
-    center_origin(plan)
 
-    outer_edges = find_largest_component_edges(plan)
-    outer = separate_edges(plan, outer_edges, "ScianyZewnetrzne")
-    plan.name = "ScianyWewnetrzne"
+    curves = [o for o in bpy.data.objects if o.type == "CURVE"]
+    print(f"  zaimportowano {len(curves)} krzywych")
+    if not curves:
+        raise RuntimeError("SVG nie zaimportowal zadnych krzywych")
 
-    extrude_up(plan, WALL_HEIGHT)
-    extrude_up(outer, WALL_HEIGHT)
-    add_solidify(outer, OUTER_THICK, offset=-1.0)
+    bm = build_combined_bmesh(curves)
+    print(f"  bmesh: {len(bm.verts)} v, {len(bm.edges)} e")
+    if not bm.verts:
+        bm.free()
+        raise RuntimeError("Krzywe SVG sa puste")
+
+    scale_and_center_bmesh(bm, target_w, target_h)
+    bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=MERGE_DIST)
+    bm.verts.index_update()
+    bm.edges.index_update()
+    print(f"  po merge: {len(bm.verts)} v, {len(bm.edges)} e")
+
+    outer_bm, inner_bm = split_outer(bm)
+    bm.free()
+
+    extrude_bmesh_up(outer_bm, WALL_HEIGHT)
+    extrude_bmesh_up(inner_bm, WALL_HEIGHT)
+
+    cleanup_orphan_curves()
+
+    outer_obj = make_object_from_bmesh(outer_bm, "ScianyZewnetrzne")
+    inner_obj = make_object_from_bmesh(inner_bm, "ScianyWewnetrzne")
+    add_solidify(outer_obj, OUTER_THICK, offset=-1.0)
 
     print(f"OK — wysokosc {WALL_HEIGHT} m, sciany zewn. {OUTER_THICK*100:.0f} cm")
 
